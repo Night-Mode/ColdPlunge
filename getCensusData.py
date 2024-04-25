@@ -44,7 +44,7 @@ df['Median_value_owned_housing_ units'] = pd.to_numeric(df['Median_value_owned_h
 df['Median_year_housing_units_age'] = pd.to_numeric(df['Median_year_housing_units_age'])
 df['Median_household_income'] = pd.to_numeric(df['Median_household_income'])
 
-# Filter the DataFrame to include only rows where 'Median Income' is greater than 20000
+# Filter the DataFrame to include only rows where 'Population' is greater than 20000
 filtered_df = df[df['Population'] > 20000]
 
 # Calculate percentage of the Population
