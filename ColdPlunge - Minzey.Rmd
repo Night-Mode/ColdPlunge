@@ -1,0 +1,474 @@
+---
+title: "Cold Plunge Market Suitability Tool"
+author: "Michael Minzey"
+date: "`r format(Sys.Date(), '%A, %B %d, %Y')`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+warning: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, messages = FALSE, warnings = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(skimr)
+library(flextable)
+library(tibble)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(rlang)
+library(scales)
+library(broom)
+library(ggthemes)
+library(boot)
+library(readxl)
+library(openxlsx)
+library(writexl)
+library(readr)
+library(tidyverse)
+library(tidymodels)
+library(pscl)
+library(maps)
+library(car)
+library(pROC)
+
+```
+
+```{r load-pop-data}
+popfilepath <- "./data/SUB-IP-EST2022-POP.xlsx"
+raw_pop_data <- read_excel(popfilepath)
+
+placefilepath <- "./data/place_by_county2020.xlsx"
+place_data <- read_excel(placefilepath)
+```
+
+```{r clean-pop-data}
+
+
+# Drop the second, third, and fourth columns
+raw_pop_data <- raw_pop_data[, -c(2, 3, 4)]
+raw_pop_data <- raw_pop_data[-c(1:3), ]
+
+# Rename columns
+colnames(raw_pop_data)[1] <- "Name"
+colnames(raw_pop_data)[2] <- "Population"
+
+# Filter out rows where Population is less than 20,000
+pop_data <- raw_pop_data %>%
+  filter(Population >= 20000)
+
+# Move state to new column, "State"
+pop_data <- pop_data %>%
+  mutate(State = sub(".*?,\\s*", "", Name), # Extracts everything after the comma for the State column
+         Place = sub(",.*", "", Name)) # Removes everything after the comma in the City column
+
+# Remove city type (city, town, village, etc.)
+pop_data <- pop_data %>%
+  mutate(City = gsub("\\b[a-z]\\w*\\b", "", Place), # Remove lowercase words
+         City = gsub("\\s{2,}", " ", City), # Replace multiple spaces with a single space
+         City = trimws(City), # Trim leading and trailing spaces
+         State = trimws(State)) # Trim leading and trailing spaces
+
+# Function to convert state name to state abbreviation
+convert_state_to_abb <- function(state_name) {
+  # Ensure that state_name is character and not factor
+  state_name <- as.character(state_name)
+
+  # Check for "District of Columbia" explicitly
+  if (state_name == "District of Columbia") {
+    return("DC")
+  }
+
+  # Find the index of the state name in state.name
+  index <- match(state_name, state.name)
+
+  # Return the corresponding abbreviation from state.abb                                    
+  if (!is.na(index)) {
+    return(state.abb[index])
+  } else {
+    # Modify the warning to include the state name that was not found
+    warning(sprintf("State name '%s' not found", state_name))
+    return(NA)
+  }
+}
+
+pop_data <- pop_data %>%
+  mutate(`State Abbr` = sapply(State, convert_state_to_abb))
+ 
+# Join 'pop_data' with 'place_data' to get 'PLACEFP'
+# Ensure both dataframes have the 'State' and 'Place' columns properly formatted
+pop_data <- pop_data %>%
+  left_join(place_data, by = c("State Abbr" = "STATE", "Place" = "PLACENAME")) %>%
+  select(-COUNTYFP, -COUNTYNAME, -PLACENS) # Remove unnecessary columns from the final dataframe
+
+# Check and see if any rows have NA for PLACEFP after the join which indicates no match was found
+pop_data_with_na <- pop_data[is.na(pop_data$PLACEFP), ]
+if (nrow(pop_data_with_na) > 0) {
+warning("Some places did not match and have NA in PLACEFP. Review the mismatches.")
+}
+
+pop_data <- pop_data %>% distinct()
+
+```
+
+```{r export-pop-data}
+out_path <- "./data/pop_data.xlsx"
+
+# Export data for use with API toolchain
+write.xlsx(pop_data, file = out_path, rowNames = FALSE)
+```
+
+```{r load-biz-data}
+bizfilepath <- "./data/api_response_data_full.xlsx"
+biz_data <- read_excel(bizfilepath)
+
+```
+
+```{r biz-data-freq}
+# Aggregate the data by PLACEFP
+biz_data_freq <- biz_data %>%
+  group_by(PLACEFP) %>%
+  summarise(Count = n())
+```
+
+```{r join-biz-pop-data}
+# Left join pop_data with biz_data_freq
+biz_pop_data <- left_join(pop_data, biz_data_freq, by = "PLACEFP")
+
+# Replace NA in Count with 0
+biz_pop_data$Count[is.na(biz_pop_data$Count)] <- 0
+```
+
+```{r load-census-data}
+censusfilepath <- "./data/us_census_data.xlsx"
+census_data <- read_excel(censusfilepath)
+
+```
+
+```{r join-census-data}
+final_data <- inner_join(biz_pop_data, census_data, by = c("Name" = "Location"))
+finalfilepath <- "./data/final_data.xlsx"
+write.xlsx(pop_data, file = finalfilepath, rowNames = FALSE)
+```
+
+```{r final-data-eda}
+# Checking for missing values
+missing_values <- sapply(final_data, function(x) sum(is.na(x)))
+print("Missing values per column:")
+print(missing_values)
+
+rows_with_na <- which(rowSums(is.na(final_data)) > 0)
+print("Rows with missing values:")
+print(final_data[rows_with_na, ])
+
+# Checking for duplicate rows
+duplicates <- final_data[duplicated(final_data), ]
+print("Duplicate rows:")
+print(duplicates)
+
+```
+
+```{r model-prep }
+# Remove columns not needed for testing
+model_data <- final_data %>%
+  select(-Name, -Population.x, -Place, -STATEFP, -PLACEFP, -TYPE, -CLASSFP, -FUNCSTAT, -'state', -'place')
+
+model_data <- model_data %>% rename("State_abbr" = "State Abbr")
+
+
+# Rename columns
+colnames(model_data)[5] <- "Population"
+colnames(model_data)[8] <- "Poverty_status"
+colnames(model_data)[11] <- "Median_value_owned_housing_units"
+
+# Convert categorical variables to factors
+model_data$'State_abbr' <- as.factor(model_data$'State_abbr')
+
+#Remove Washington DC
+model_data <- model_data %>%
+  filter(State_abbr != "DC")
+
+
+
+```
+
+```{r model-data-eval}
+# Create a histogram of the Count variable
+ggplot(model_data, aes(x = Count)) +
+  geom_histogram(binwidth = 5, fill = "blue", color = "black") +
+  labs(title = "Cold Plunge Business Count per American City (Population >20,000)", x = "Count", y = "Frequency") +
+  theme_minimal()
+
+
+# Examine Dispersion
+mean_count <- mean(model_data$Count)
+var_count <- var(model_data$Count)
+dispersion_statistic <- var_count / mean_count
+
+# Summarize count data by state
+model_data_state <- model_data %>%
+  group_by(State) %>%
+  summarise(total_count = sum(Count))
+
+# Make sure state names in your data match the map data
+model_data_state$state_lc <- tolower(model_data_state$State)
+
+# Get US states map
+states_map <- map_data("state")
+
+# Merge your data with the map data
+states_map <- merge(states_map, model_data_state, by.x = "region", by.y = "state_lc", all.x = TRUE)
+
+# Handle NAs if any states are missing in your data
+states_map$total_count[is.na(states_map$total_count)] <- 0
+
+# Create the map
+map_plot <- ggplot(states_map, aes(x = long, y = lat, group = group, fill = total_count)) +
+  geom_polygon(color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", na.value = "grey50", guide = "colourbar") +
+  labs(title = "US States Map Colored by Count", fill = "Count") +
+  theme_minimal() +
+  theme(axis.text = element_blank(), 
+        axis.title = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.grid = element_blank())
+
+# Display the map
+print(map_plot)
+
+# Sort the dataframe by total_count in descending order
+model_data_state <- model_data_state %>%
+  arrange(desc(total_count))
+
+# Select the top 10 states
+top_10_states <- head(model_data_state, 15)
+
+# Create a horizontally oriented bar chart
+bar_plot <- ggplot(top_10_states, aes(x = reorder(State, total_count), y = total_count)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +  # Flip coordinates to make it horizontal
+  labs(title = "Top 15 States by Total Count", x = "State", y = "Count") +
+  theme_minimal()
+
+# Display the bar chart
+print(bar_plot)
+
+
+# Create the scatter plot
+ggplot(model_data, aes(x = Population, y = Count)) +
+  geom_point() +  # Add points for each data point
+  labs(x = "Population", y = "Count", title = "Comparison of Count and Population") +
+  theme_minimal()  # Optional: Apply minimal theme for better visualization
+
+
+
+# Create the boxplot for population
+boxplot(model_data$Population, 
+        main = "Boxplot of Population",  # Main title of the plot
+        ylab = "Population")  # Label for the y-axis
+
+# Create a histogram for population
+ggplot(model_data, aes(x = Population)) +
+  geom_histogram(binwidth = 1000, fill = "skyblue", color = "black") +
+  labs(x = "Population", y = "Frequency", title = "Distribution of Population (Histogram)") +
+  theme_minimal()
+
+# Remove rows with population over 1000000
+model_data <- model_data[model_data$Population <= 500000, ]
+
+# Create the scatter plot
+ggplot(model_data, aes(x = Population, y = Count)) +
+  geom_point() +  # Add points for each data point
+  labs(x = "Population", y = "Count", title = "Comparison of Count and Population") +
+  theme_minimal()  # Optional: Apply minimal theme for better visualization
+
+
+
+# Create the boxplot for population
+boxplot(model_data$Population, 
+        main = "Boxplot of Population",  # Main title of the plot
+        ylab = "Population")  # Label for the y-axis
+
+# Create a histogram for population
+ggplot(model_data, aes(x = Population)) +
+  geom_histogram(binwidth = 1000, fill = "skyblue", color = "black") +
+  labs(x = "Population", y = "Frequency", title = "Distribution of Population (Histogram)") +
+  theme_minimal()
+
+
+```
+
+```{r remove-pop-outliers}
+# Calculate the lower and upper bounds using quantiles
+q1 <- quantile(model_data$Population, 0.25)
+q3 <- quantile(model_data$Population, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Remove outliers using filter
+model_data <- model_data %>%
+  filter(Population >= lower_bound, Population <= upper_bound)
+
+```
+
+```{r remove-count-outliers}
+# Calculate the lower and upper bounds using quantiles
+q1 <- quantile(model_data$Count, 0.25)
+q3 <- quantile(model_data$Count, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Remove outliers using filter
+model_data <- model_data %>%
+  filter(Count >= lower_bound, Count <= upper_bound)
+
+```
+
+
+
+```{r}
+# Check unique values in the merging column for each data frame
+unique_values_states_map <- unique(states_map$region)
+unique_values_model_data <- unique(model_data$State_abbr)
+
+print(unique_values_states_map)
+print(unique_values_model_data)
+
+```
+
+```{r multicol-check}
+# Create multicollinearity data set with removed non-numeric fields
+model_data_multi <- model_data
+
+model_data_multi <- model_data_multi %>%
+  select(-State, -City, -State_abbr)
+
+# Calculate the correlation matrix
+correlation_matrix <- cor(model_data_multi)
+
+# Print correlation matrix
+print(correlation_matrix)
+
+# Compute VIF for each predictor variable
+lm_model <- lm(Count ~ ., data = model_data_multi)
+vif_results <- vif(lm_model)
+
+print(vif_results)
+
+```
+
+
+```{r zero-signficance}
+# Create a binary indicator variable for zero counts
+model_data_zero <- model_data
+
+model_data_zero$Zero_Indicator <- as.numeric(model_data$Count == 0)
+model_data_zero <- model_data_zero %>%
+  select(-State_abbr, -Count, -City)
+
+# Fit the logistic regression model
+zero_model <- glm(Zero_Indicator ~ .,  family = binomial(), data = model_data_zero)
+
+# View the summary of the model
+summary(zero_model)
+
+
+```
+
+
+```{r test-train-sets}
+model_data <- model_data %>%
+  select(-State, -City )
+
+set.seed(631)
+
+# Put 80% of the data into the training set
+model_split <- initial_split(model_data, prop = 0.80)
+
+
+# Assign the two splits to data frames
+model_train <- training(model_split)
+model_test <- testing(model_split)
+
+```
+
+```{r poisson-model}
+# Fit Poisson model
+pos_model <- glm(Count ~ ., data = model_train, family = "poisson")
+
+# Summary of the Poisson model
+summary(pos_model)
+```
+
+```{r predict-models}
+
+# Predict with the models
+model_test$predicted_pos <- predict(pos_model, newdata = model_test, type = "response")
+
+```
+
+
+```{r residual-plots}
+
+# Calculate residuals
+model_test$residuals_pos <- model_test$Count - model_test$predicted_pos
+
+# Create residual plot
+plot(model_test$predicted_pos, model_test$residuals_pos, xlab = "Predicted Counts", ylab = "Residuals",
+     main = "Residual Plot for Poisson Model", pch = 16)
+abline(h = 0, col = "red", lwd = 2)  # Add horizontal line at y = 0 for reference
+
+```
+```{r}
+levels_data_frame <- data.frame(
+  Level = levels(model_test$State_abbr),
+  Code = as.integer(factor(levels(model_test$State_abbr)))
+)
+
+
+```
+
+
+```{r GR-test}
+# Testing GR stats
+GR_observation <- data.frame(
+  State_abbr = 'MI',  
+  Population = 198096, 
+  Total_population_Female = 50.2,
+  Median_age = 31.8,
+  Poverty_status = 96.4,
+  Health_insurance_coverage = 98.3,
+  Median_gross_rent = 1138,
+  Median_value_owned_housing_units = 203900,
+  Median_year_housing_units_age = 1953,
+  Median_household_income = 61634
+)
+
+# Use predict() to obtain the predicted value for the new observation
+predicted_count <- predict(pos_model, newdata = GR_observation, type = "response")
+predicted_count
+```
+```{r residual-table}
+model_test_resid <- model_test %>% select(Count, predicted_pos, residuals_pos)
+random_indices <- sample(nrow(model_test_resid))
+
+colnames(model_test_resid)[1] <- "Actual Count"
+colnames(model_test_resid)[2] <- "Predicted Count"
+colnames(model_test_resid)[3] <- "Residual"
+randomized_df <- model_test_resid[random_indices, ]
+
+```
+
+
+
+
+
+
+
